@@ -4,7 +4,7 @@
 
 **A progressive, script-based journey through Retrieval-Augmented Generation — from the simplest pipeline to a self-reflecting agent. Free-tier stack, zero local model downloads.**
 
-[![CI](https://github.com/Suhaila-Samir-El-behairy/rag-from-scratch-to-agentic/actions/workflows/ci.yml/badge.svg)](https://github.com/your-username/rag-from-scratch-to-agentic/actions/workflows/ci.yml)
+[![CI](https://github.com/Suhaila-Samir-El-behairy/rag-from-scratch-to-agentic/actions/workflows/ci.yml/badge.svg)](https://github.com/Suhaila-Samir-El-behairy/rag-from-scratch-to-agentic/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
