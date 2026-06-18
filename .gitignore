@@ -1,0 +1,33 @@
+# Environment
+.venv/
+venv/
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Test/coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Tooling
+.ruff_cache/
+.mypy_cache/
+
+# Project data
+chroma_db/
+bm25_cache*.pkl
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
