@@ -17,7 +17,7 @@
 
 ## Why this project?
 
-Most RAG tutorials either stop at "vector search + prompt" or jump straight into a 500-line LangGraph demo. This repo walks the **middle path** — seven progressive scripts that build on each other, each adding exactly one technique:
+Most RAG tutorials either stop at "vector search + prompt" or jump straight into a 500-line LangGraph demo. This repo walks the **middle path**, seven progressive scripts that build on each other, each adding exactly one technique:
 
 - **Scripts, not notebooks** — production-shaped code you can read, debug, and deploy
 - **Free-tier stack** — runs on Groq + HuggingFace + LangSmith free tiers, no credit card
