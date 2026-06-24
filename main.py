@@ -10,6 +10,8 @@ SCRIPTS = {
     "05": "ragkit.scripts.05_retrieval",
     "06": "ragkit.scripts.06_self_reflection",
     "07": "ragkit.scripts.07_agentic_rag",
+    "08": "ragkit.scripts.08_corrective_rag",       
+    "09": "ragkit.scripts.09_graph_rag",            
 }
 
 def main():

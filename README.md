@@ -47,6 +47,8 @@ Seven scripts. Each one adds exactly one technique. Each builds on the previous.
 | 05 | `05_retrieval.py`| Higher-precision retrieval with reranking + hybrid | FlashRank, RAG-Fusion, BM25 + dense ensemble |
 | 06 | `06_self_reflection.py`| RAG that critiques its own retrieval + generation | LangGraph state machine with retry loops |
 | 07 | `07_agentic_rag.py`| ReAct agent picks tools dynamically | Native function calling, multi-step reasoning |
+| 08 | `08_corrective_rag.py` | Corrective RAG: grade retrieval, fall back to web if needed | Paper-faithful CRAG (Yan et al. 2024) with T-correct decision rule |
+| 09 | `09_graph_rag.py` | Graph RAG: extract entities + relationships, answer from graph | In-memory NetworkX knowledge graph, k-hop neighborhood retrieval |
 
 ## Architecture Flow
 
@@ -117,7 +119,9 @@ rag-from-scratch-to-agentic/
 │ ├── 04_indexing.py
 │ ├── 05_retrieval.py
 │ ├── 06_self_reflection.py
-│ └── 07_agentic_rag.py
+│ ├── 07_agentic_rag.py
+│ ├── 08_corrective_rag.py
+│ └── 09_graph_rag.py
 ├── tests/
 │   ├── test_config.py
 │   ├── test_utils.py
