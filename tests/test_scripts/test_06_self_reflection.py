@@ -36,9 +36,7 @@ def _build_app(monkeypatch, tmp_path, doc="yes", grounded="yes", answers="yes"):
 
 def _run(app):
     # A low recursion limit turns any unbounded loop into a test failure.
-    return app.invoke(
-        {"question": "q", "retries": 0, "generations": 0}, {"recursion_limit": 20}
-    )
+    return app.invoke({"question": "q", "retries": 0, "generations": 0}, {"recursion_limit": 20})
 
 
 def test_happy_path_generates_once(monkeypatch, tmp_path):
