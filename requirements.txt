@@ -1,8 +1,13 @@
+# Mirrors [project.dependencies] in pyproject.toml.
+# Preferred install: pip install -e ".[dev]"
+
 # Core orchestration
 langchain>=0.3.0
 langchain-community>=0.3.0
 langchain-core>=0.3.0
 langchain-chroma>=0.1.0
+langchain-classic>=0.1.0
+langchain-experimental>=0.3.0
 langgraph>=0.2.0
 chromadb>=0.5.0
 networkx>=3.0
@@ -15,13 +20,15 @@ langchain-groq>=0.2.0                # primary recommendation
 langchain-huggingface>=0.1.0
 huggingface-hub>=0.25.0
 
-# Free reranking
+# Free reranking + keyword retrieval
 flashrank>=0.2.0
+rank-bm25>=0.2.2
 
 # Free web search (no key)
-duckduckgo-search>=6.0.0
+ddgs>=9.0.0
 
 # Loaders + utilities
+tiktoken>=0.7.0
 pypdf>=5.0.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
