@@ -18,6 +18,8 @@ Flow:
   4. Grade for hallucinations → if hallucinated, regenerate
   5. Grade for answer quality → if not addressing question, rewrite and retry
   6. End when grounded + answers question, or after MAX_RETRIES
+     (rewrites and regenerations are capped independently, so the graph
+     always terminates)
 
 Built with LangGraph for explicit stateful control flow.
 """
@@ -140,7 +142,13 @@ class GraphState(TypedDict):
     question: str
     generation: str
     documents: list
-    retries: int
+    retries: int  # number of question rewrites so far
+    generations: int  # number of answers generated so far
+
+
+def is_yes(score) -> bool:
+    """Graders return free-form strings; accept 'yes', 'Yes', ' yes.' etc."""
+    return score.binary_score.strip().lower().startswith("yes")
 
 
 # ============================================================
@@ -164,7 +172,7 @@ def make_generate(rag_chain):
                 "question": state["question"],
             }
         )
-        return {"generation": generation}
+        return {"generation": generation, "generations": state.get("generations", 0) + 1}
 
     return generate
 
@@ -190,11 +198,14 @@ def make_route_after_retrieve(doc_grader):
         score = doc_grader.invoke(
             {
                 "question": state["question"],
-                "documents": state["documents"],
+                "documents": format_docs(state["documents"]),
             }
         )
-        if score.binary_score == "yes":
+        if is_yes(score):
             print("  [route] docs relevant → generate", file=sys.stderr)
+            return "generate"
+        if state.get("retries", 0) >= MAX_RETRIES:
+            print("  [route] docs not relevant, no retries left → generate", file=sys.stderr)
             return "generate"
         print("  [route] docs not relevant → rewrite", file=sys.stderr)
         return "rewrite"
@@ -205,17 +216,18 @@ def make_route_after_retrieve(doc_grader):
 def make_route_after_generate(hallucination_grader, answer_grader):
     def route_after_generate(state):
         retries = state.get("retries", 0)
+        regenerations = state.get("generations", 1) - 1
 
         # Check hallucination first
         h_score = hallucination_grader.invoke(
             {
-                "documents": state["documents"],
+                "documents": format_docs(state["documents"]),
                 "generation": state["generation"],
             }
         )
-        if h_score.binary_score == "no":
-            print(f"  [route] hallucinated (retry {retries})", file=sys.stderr)
-            return "generate" if retries < MAX_RETRIES else "end"
+        if not is_yes(h_score):
+            print(f"  [route] hallucinated (regeneration {regenerations})", file=sys.stderr)
+            return "generate" if regenerations < MAX_RETRIES else "end"
 
         # Then check answer quality
         a_score = answer_grader.invoke(
@@ -224,7 +236,7 @@ def make_route_after_generate(hallucination_grader, answer_grader):
                 "generation": state["generation"],
             }
         )
-        if a_score.binary_score == "no":
+        if not is_yes(a_score):
             print(f"  [route] doesn't answer (retry {retries})", file=sys.stderr)
             return "rewrite" if retries < MAX_RETRIES else "end"
 
@@ -307,7 +319,7 @@ def main():
 
     print(f"\n[run] Question: {args.question}\n", file=sys.stderr)
     print("=" * 60)
-    result = app.invoke({"question": args.question, "retries": 0})
+    result = app.invoke({"question": args.question, "retries": 0, "generations": 0})
 
     if result.get("generation"):
         print(result["generation"])
