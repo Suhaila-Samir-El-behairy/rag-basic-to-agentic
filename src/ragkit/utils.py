@@ -3,11 +3,8 @@
 import logging
 from functools import lru_cache
 
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-from ragkit.config import (
+# Import config first: it sets USER_AGENT before langchain_community's web loader reads it.
+from ragkit.config import (  # isort: skip
     CHROMA_DIR,
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
@@ -19,6 +16,10 @@ from ragkit.config import (
     TAVILY_API_KEY,
     get_default_llm_model,
 )
+
+from langchain_chroma import Chroma  # noqa: E402
+from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader  # noqa: E402
+from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -94,16 +95,17 @@ def get_vectorstore(splits, name: str, embeddings=None):
     persist_dir = CHROMA_DIR / name
     embeddings = embeddings or get_embeddings()
 
-    if (persist_dir / "chroma.sqlite3").exists():
+    vectorstore = Chroma(persist_directory=str(persist_dir), embedding_function=embeddings)
+    # A previous run can leave an empty store behind if embedding failed midway
+    # (e.g. HF rate limit), so check for content rather than for the file.
+    if vectorstore.get(limit=1)["ids"]:
         logger.info("Loading existing vector store: %s", name)
-        return Chroma(persist_directory=str(persist_dir), embedding_function=embeddings)
+        return vectorstore
 
-    logger.info("Building new vector store: %s (%d splits)", name, len(splits))
-    return Chroma.from_documents(
-        documents=splits,
-        embedding=embeddings,
-        persist_directory=str(persist_dir),
-    )
+    if splits:
+        logger.info("Building new vector store: %s (%d splits)", name, len(splits))
+        vectorstore.add_documents(splits)
+    return vectorstore
 
 
 def web_search(query: str, max_results: int = 3) -> str:
@@ -114,7 +116,7 @@ def web_search(query: str, max_results: int = 3) -> str:
         results = TavilyClient(api_key=TAVILY_API_KEY).search(query, max_results=max_results)
         return "\n\n".join(r["content"] for r in results["results"])
 
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 
     with DDGS() as ddgs:
         hits = list(ddgs.text(query, max_results=max_results))

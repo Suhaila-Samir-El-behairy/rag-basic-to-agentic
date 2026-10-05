@@ -4,7 +4,7 @@
 
 **A progressive, script-based journey through Retrieval-Augmented Generation — from the simplest pipeline to a self-reflecting agent. Free-tier stack, zero local model downloads.**
 
-[![CI](https://github.com/Suhaila-Samir-El-behairy/rag-from-scratch-to-agentic/actions/workflows/ci.yml/badge.svg)](https://github.com/Suhaila-Samir-El-behairy/rag-from-scratch-to-agentic/actions/workflows/ci.yml)
+[![CI](https://github.com/Suhaila-Samir-El-behairy/rag-basic-to-agentic/actions/workflows/ci.yml/badge.svg)](https://github.com/Suhaila-Samir-El-behairy/rag-basic-to-agentic/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
@@ -17,7 +17,7 @@
 
 ## Why this project?
 
-Most RAG tutorials either stop at "vector search + prompt" or jump straight into a 500-line LangGraph demo. This repo walks the **middle path**, seven progressive scripts that build on each other, each adding exactly one technique:
+Most RAG tutorials either stop at "vector search + prompt" or jump straight into a 500-line LangGraph demo. This repo walks the **middle path**, nine progressive scripts that build on each other, each adding exactly one technique:
 
 - **Scripts, not notebooks** — production-shaped code you can read, debug, and deploy
 - **Free-tier stack** — runs on Groq + HuggingFace + LangSmith free tiers, no credit card
@@ -27,8 +27,8 @@ Most RAG tutorials either stop at "vector search + prompt" or jump straight into
 ## TL;DR
 
 ```bash
-git clone https://github.com/your-username/rag-from-scratch-to-agentic.git
-cd rag-from-scratch-to-agentic
+git clone https://github.com/Suhaila-Samir-El-behairy/rag-basic-to-agentic.git
+cd rag-basic-to-agentic
 pip install -e ".[dev]"
 cp .env.example .env  # add GROQ_API_KEY, HUGGINGFACEHUB_API_TOKEN, LANGCHAIN_API_KEY
 inv run -n 01 -q "What is task decomposition?"
@@ -36,7 +36,7 @@ inv run -n 01 -q "What is task decomposition?"
 
 ## The Journey
 
-Seven scripts. Each one adds exactly one technique. Each builds on the previous.
+Nine scripts. Each one adds exactly one technique. Each builds on the previous.
 
 | # | Script | What it does | Technique |
 |---|--------|--------------|-----------|
@@ -101,15 +101,15 @@ Three graders (document relevance, hallucination, answer quality) control the fl
 rag-from-scratch-to-agentic/
 ├── pyproject.toml # package + tool config
 ├── tasks.py # invoke task runner (cross-platform)
-├── Makefile # legacy (kept for Linux users)
 ├── README.md
 ├── LICENSE
 ├── .gitignore
 ├── .env.example
-├── main.py # CLI dispatcher
+├── main.py # CLI dispatcher (wraps ragkit.cli)
 ├── src/
 │   └── ragkit/
 │       ├── __init__.py
+│       ├── cli.py          # `ragkit` command / script dispatcher
 │       ├── config.py       # env loading + paths
 │       ├── utils.py # shared loaders, splitters, vectorstore, web search
 │       └── scripts/
@@ -126,7 +126,9 @@ rag-from-scratch-to-agentic/
 │   ├── test_config.py
 │   ├── test_utils.py
 │   └── test_scripts/
-│       └── test_01_basic_rag.py
+│       ├── test_01_basic_rag.py
+│       ├── test_06_self_reflection.py
+│       └── test_script_logic.py
 └── .github/
     └── workflows/
         └── ci.yml # CI: lint + format + test on push
@@ -137,8 +139,8 @@ rag-from-scratch-to-agentic/
 ### 1. Clone
 
 ```bash
-git clone https://github.com/your-username/rag-from-scratch-to-agentic.git
-cd rag-from-scratch-to-agentic
+git clone https://github.com/Suhaila-Samir-El-behairy/rag-basic-to-agentic.git
+cd rag-basic-to-agentic
 ```
 
 ### 2. Create a virtual environment
@@ -199,13 +201,14 @@ python -m ragkit.scripts.02_query_transformations --question "What is task decom
 python -m ragkit.scripts.05_retrieval --question "What is task decomposition?" --method rerank
 python -m ragkit.scripts.07_agentic_rag --question "What is task decomposition?" --verbose
 
-# Via the CLI dispatcher
+# Via the CLI dispatcher (or the installed `ragkit` command)
 python main.py 01 --question "What is task decomposition?"
-python main.py 05 --question "What is task decomposition?" --method rerank
+ragkit 05 --question "What is task decomposition?" --method rerank
 
 # Via invoke (recommended)
 inv run -n 01 -q "What is task decomposition?"
 inv run -n 02 -q "What is task decomposition?"  # with default --method rag-fusion
+inv run -n 05 -q "What is task decomposition?" -e "--method hybrid"
 ```
 
 ### Script-specific flags
@@ -216,13 +219,15 @@ inv run -n 02 -q "What is task decomposition?"  # with default --method rag-fusi
 | 04 | `--strategy` | `recursive`, `character`, `token`, `semantic`, `multi-rep` |
 | 05 | `--method` | `basic`, `rerank`, `rag-fusion`, `hybrid` |
 | 07 | `--verbose`, `--max-steps`| debug agent loop, limit recursion |
+| 08 | `--upper`, `--lower` | T-correct thresholds (default 0.7 / 0.3) |
+| 09 | `--hops`, `--rebuild` | subgraph radius, rebuild cached graph |
 
 ### Compare methods on the same question
 
 ```bash
 for method in multi-query rag-fusion hyde step-back; do
     echo "=== $method ==="
-    inv run -n 02 -q "What is task decomposition?" --method $method 2>/dev/null
+    inv run -n 02 -q "What is task decomposition?" -e "--method $method" 2>/dev/null
     echo
 done
 ```
@@ -230,7 +235,7 @@ done
 ## Development
 
 ```bash
-inv test   # run pytest (10 tests)
+inv test   # run pytest (offline, no API keys needed)
 inv lint   # ruff check
 inv format # ruff format
 inv clean  # remove cache + vector stores
@@ -257,9 +262,14 @@ repos:
 
 ## Switching Providers
 
-Swap Groq for Google's free Gemini tier in one `.env` line:
+Swap Groq for Google's free Gemini tier: install the extra, then set two `.env` lines:
 
 ```bash
+pip install -e ".[gemini]"
+```
+
+```bash
+# .env
 LLM_PROVIDER=gemini
 GOOGLE_API_KEY=AIza_...
 ```
@@ -293,7 +303,7 @@ No other code changes — `get_llm()` in `ragkit/utils.py` handles both.
 - [x] Test suite + CI (GitHub Actions)
 - [x] Cross-platform task runner (`invoke`)
 - [x] Free-tier cloud stack (no local downloads)
-- [ ] Unit tests for each script (currently 1 of 7)
+- [ ] Unit tests for each script (offline tests cover 01, 04, 06, 07, 08, 09)
 - [ ] Streamlit demo with side-by-side method comparison
 - [ ] RAGAS evaluation harness
 - [ ] FastAPI wrapper exposing scripts as endpoints

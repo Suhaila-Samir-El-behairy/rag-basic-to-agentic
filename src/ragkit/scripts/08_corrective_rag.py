@@ -13,35 +13,36 @@ This is the "original" CRAG (Corrective), distinct from
 cache-augmented CRAG (faster/cheaper) and from script 06's
 self-reflection (multi-turn retry).
 """
-import sys
-import pickle
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import argparse
-from pydantic import BaseModel, Field
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+import pickle
+import sys
 
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+from ragkit.config import CHROMA_DIR
 from ragkit.utils import (
+    format_docs,
     get_llm,
-    get_embeddings,
+    get_vectorstore,
     load_web,
     split_docs,
-    get_vectorstore,
-    format_docs,
     web_search,
 )
 
 URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
-BM25_CACHE = Path("./bm25_cache_08.pkl")
+BM25_CACHE = CHROMA_DIR / "splits_08.pkl"
 UPPER_THRESHOLD = 0.7
 LOWER_THRESHOLD = 0.3
+
 
 # ---------- Document grader ----------
 class DocumentGrade(BaseModel):
     score: float = Field(description="Relevance score 0.0 to 1.0")
     reasoning: str = Field(description="One-sentence explanation")
+
 
 def build_doc_grader():
     prompt = ChatPromptTemplate.from_template(
@@ -59,6 +60,7 @@ Respond with JSON: {{"score": 0.X, "reasoning": "..."}}"""
     )
     return prompt | get_llm().with_structured_output(DocumentGrade)
 
+
 # ---------- Query refiner ----------
 def build_query_refiner():
     prompt = ChatPromptTemplate.from_template(
@@ -72,6 +74,7 @@ Partial context: {context}
 Output ONLY the refined question, no preamble."""
     )
     return prompt | get_llm() | StrOutputParser()
+
 
 # ---------- Answer generator ----------
 def build_answer_chain():
@@ -88,6 +91,7 @@ Answer:"""
     )
     return prompt | get_llm() | StrOutputParser()
 
+
 # ---------- Setup ----------
 def setup_vectorstore():
     if BM25_CACHE.exists():
@@ -101,15 +105,22 @@ def setup_vectorstore():
     vectorstore = get_vectorstore(splits, name="08_corrective")
     return vectorstore.as_retriever(search_kwargs={"k": 4})
 
+
 # ---------- T-correct algorithm ----------
 def t_correct_decision(scores, upper=UPPER_THRESHOLD, lower=LOWER_THRESHOLD):
-    """Apply the paper's T-correct decision rule."""
-    avg = sum(scores) / len(scores)
+    """Apply the paper's T-correct decision rule.
+
+    No retrieved docs counts as INCORRECT (fall back to web search).
+    """
+    if not scores:
+        return "INCORRECT", 0.0
+    avg = sum(min(max(s, 0.0), 1.0) for s in scores) / len(scores)
     if avg >= upper:
         return "CORRECT", avg
     if avg <= lower:
         return "INCORRECT", avg
     return "AMBIGUOUS", avg
+
 
 # ---------- CLI ----------
 def main():
@@ -132,7 +143,7 @@ def main():
     args = parser.parse_args()
 
     # Setup
-    print(f"\n[setup] Building/loading vector store...", file=sys.stderr)
+    print("\n[setup] Building/loading vector store...", file=sys.stderr)
     retriever = setup_vectorstore()
     grader = build_doc_grader()
     refiner = build_query_refiner()
@@ -144,16 +155,18 @@ def main():
     print(f"  Retrieved {len(docs)} docs", file=sys.stderr)
 
     # Step 2: grade each doc
-    print(f"\n[grade] Scoring retrieved docs...", file=sys.stderr)
+    print("\n[grade] Scoring retrieved docs...", file=sys.stderr)
     grades = []
     for i, doc in enumerate(docs):
-        g = grader.invoke({
-            "question": args.question,
-            "document": doc.page_content[:2000],
-        })
+        g = grader.invoke(
+            {
+                "question": args.question,
+                "document": doc.page_content[:2000],
+            }
+        )
         grades.append((doc, g.score, g.reasoning))
         preview = g.reasoning[:80].replace("\n", " ")
-        print(f"  Doc {i+1}: score={g.score:.2f} - {preview}", file=sys.stderr)
+        print(f"  Doc {i + 1}: score={g.score:.2f} - {preview}", file=sys.stderr)
 
     # Step 3: T-correct decision
     scores = [g[1] for g in grades]
@@ -164,18 +177,23 @@ def main():
     if decision == "CORRECT":
         filtered = [d[0] for d in grades if d[1] >= 0.5]
         context = format_docs(filtered) if filtered else format_docs(docs)
-        print(f"  Using {len(filtered) if filtered else len(docs)} retrieved docs as-is", file=sys.stderr)
+        print(
+            f"  Using {len(filtered) if filtered else len(docs)} retrieved docs as-is",
+            file=sys.stderr,
+        )
 
     elif decision == "INCORRECT":
-        print(f"  Falling back to web search...", file=sys.stderr)
+        print("  Falling back to web search...", file=sys.stderr)
         context = web_search(args.question, max_results=4)
 
     else:  # AMBIGUOUS
-        print(f"  Refining query...", file=sys.stderr)
-        refined = refiner.invoke({
-            "question": args.question,
-            "context": format_docs(docs),
-        })
+        print("  Refining query...", file=sys.stderr)
+        refined = refiner.invoke(
+            {
+                "question": args.question,
+                "context": format_docs(docs),
+            }
+        )
         print(f"  Refined: {refined}", file=sys.stderr)
         filtered = [d[0] for d in grades if d[1] >= 0.5]
         retrieved_ctx = format_docs(filtered) if filtered else ""
@@ -186,13 +204,14 @@ def main():
         )
 
     # Step 5: generate answer
-    print(f"\n[generate] Producing final answer...\n", file=sys.stderr)
+    print("\n[generate] Producing final answer...\n", file=sys.stderr)
     print("=" * 60)
     answer = answer_chain.invoke({"context": context, "question": args.question})
     print(answer)
     print("=" * 60)
 
     print(f"\n[trace] Decision: {decision}, avg_score: {avg_score:.2f}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()

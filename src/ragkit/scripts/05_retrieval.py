@@ -12,18 +12,15 @@ All methods are run on the same query for easy comparison.
 import argparse
 import pickle
 import sys
-from pathlib import Path
 
 from langchain_classic.load import dumps, loads
-from langchain_classic.retrievers import (
-    BM25Retriever,
-    ContextualCompressionRetriever,
-    EnsembleRetriever,
-)
+from langchain_classic.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from langchain_classic.retrievers.document_compressors import FlashrankRerank
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
+from ragkit.config import CHROMA_DIR
 from ragkit.utils import (
     format_docs,
     get_llm,
@@ -33,7 +30,7 @@ from ragkit.utils import (
 )
 
 URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
-BM25_CACHE = Path("./bm25_cache.pkl")
+BM25_CACHE = CHROMA_DIR / "splits_05.pkl"
 
 
 # ============================================================
@@ -153,13 +150,11 @@ def main():
     args = parser.parse_args()
 
     print(f"\n[setup] Loading + indexing {URL}...", file=sys.stderr)
-    docs = load_web(URL)
-
     if BM25_CACHE.exists():
         print(f"  Loading cached splits from {BM25_CACHE}", file=sys.stderr)
         splits = pickle.load(open(BM25_CACHE, "rb"))
     else:
-        splits = split_docs(docs)
+        splits = split_docs(load_web(URL))
         pickle.dump(splits, open(BM25_CACHE, "wb"))
         print(f"  Cached {len(splits)} splits to {BM25_CACHE}", file=sys.stderr)
 
