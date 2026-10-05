@@ -11,12 +11,12 @@ The agent decides which tool(s) to use based on the question.
 import argparse
 import pickle
 import sys
-from pathlib import Path
 
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage
 
+from ragkit.config import CHROMA_DIR
 from ragkit.utils import (
     format_docs,
     get_llm,
@@ -27,7 +27,7 @@ from ragkit.utils import (
 )
 
 URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
-BM25_CACHE = Path("./bm25_cache_07.pkl")
+BM25_CACHE = CHROMA_DIR / "splits_07.pkl"
 _vectorstore = None  # global, set in setup()
 
 

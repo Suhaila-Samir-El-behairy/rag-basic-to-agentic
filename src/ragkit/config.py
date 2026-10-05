@@ -33,7 +33,7 @@ os.environ.setdefault("USER_AGENT", "ragkit/0.1.0")
 # Provider + model
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 # Chunking + retrieval

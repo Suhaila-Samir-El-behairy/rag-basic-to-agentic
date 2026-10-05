@@ -27,7 +27,6 @@ Built with LangGraph for explicit stateful control flow.
 import argparse
 import pickle
 import sys
-from pathlib import Path
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -35,6 +34,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from ragkit.config import CHROMA_DIR
 from ragkit.utils import (
     format_docs,
     get_llm,
@@ -45,7 +45,7 @@ from ragkit.utils import (
 
 URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
 MAX_RETRIES = 2
-BM25_CACHE = Path("./bm25_cache_06.pkl")
+BM25_CACHE = CHROMA_DIR / "splits_06.pkl"
 
 
 # ============================================================

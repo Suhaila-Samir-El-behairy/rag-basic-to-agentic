@@ -17,12 +17,12 @@ self-reflection (multi-turn retry).
 import argparse
 import pickle
 import sys
-from pathlib import Path
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from ragkit.config import CHROMA_DIR
 from ragkit.utils import (
     format_docs,
     get_llm,
@@ -33,7 +33,7 @@ from ragkit.utils import (
 )
 
 URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
-BM25_CACHE = Path("./bm25_cache_08.pkl")
+BM25_CACHE = CHROMA_DIR / "splits_08.pkl"
 UPPER_THRESHOLD = 0.7
 LOWER_THRESHOLD = 0.3
 
