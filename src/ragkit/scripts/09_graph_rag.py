@@ -36,6 +36,8 @@ from ragkit.config import CHROMA_DIR
 
 URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
 GRAPH_FILE = CHROMA_DIR / "09_graph.pkl"
+# Question words that would otherwise substring-match unrelated entity names
+STOPWORDS = {"what", "which", "when", "where", "does", "with", "from", "that", "this", "have"}
 
 # ---------- Entity extraction ----------
 class Entity(BaseModel):
@@ -111,7 +113,10 @@ def setup_graph():
 def find_relevant_subgraph(G, question, k_hops=2):
     """Find entities relevant to the question and extract k-hop neighborhood."""
     # Simple keyword matching first
-    question_words = [w for w in question.lower().split() if len(w) > 3]
+    question_words = [
+        w for w in (t.strip("?.,!;:\"'") for t in question.lower().split())
+        if len(w) > 3 and w not in STOPWORDS
+    ]
     matching = [n for n in G.nodes() if any(w in n.lower() for w in question_words)]
 
     if not matching:

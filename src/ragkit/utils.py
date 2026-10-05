@@ -95,16 +95,17 @@ def get_vectorstore(splits, name: str, embeddings=None):
     persist_dir = CHROMA_DIR / name
     embeddings = embeddings or get_embeddings()
 
-    if (persist_dir / "chroma.sqlite3").exists():
+    vectorstore = Chroma(persist_directory=str(persist_dir), embedding_function=embeddings)
+    # A previous run can leave an empty store behind if embedding failed midway
+    # (e.g. HF rate limit), so check for content rather than for the file.
+    if vectorstore.get(limit=1)["ids"]:
         logger.info("Loading existing vector store: %s", name)
-        return Chroma(persist_directory=str(persist_dir), embedding_function=embeddings)
+        return vectorstore
 
-    logger.info("Building new vector store: %s (%d splits)", name, len(splits))
-    return Chroma.from_documents(
-        documents=splits,
-        embedding=embeddings,
-        persist_directory=str(persist_dir),
-    )
+    if splits:
+        logger.info("Building new vector store: %s (%d splits)", name, len(splits))
+        vectorstore.add_documents(splits)
+    return vectorstore
 
 
 def web_search(query: str, max_results: int = 3) -> str:

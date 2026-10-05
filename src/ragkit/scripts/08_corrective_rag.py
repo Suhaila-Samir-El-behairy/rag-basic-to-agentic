@@ -103,8 +103,13 @@ def setup_vectorstore():
 
 # ---------- T-correct algorithm ----------
 def t_correct_decision(scores, upper=UPPER_THRESHOLD, lower=LOWER_THRESHOLD):
-    """Apply the paper's T-correct decision rule."""
-    avg = sum(scores) / len(scores)
+    """Apply the paper's T-correct decision rule.
+
+    No retrieved docs counts as INCORRECT (fall back to web search).
+    """
+    if not scores:
+        return "INCORRECT", 0.0
+    avg = sum(min(max(s, 0.0), 1.0) for s in scores) / len(scores)
     if avg >= upper:
         return "CORRECT", avg
     if avg <= lower:

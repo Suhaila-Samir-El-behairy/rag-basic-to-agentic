@@ -45,7 +45,7 @@ def vector_search(query: str) -> str:
     return format_docs(docs)
 
 
-@tool
+@tool("web_search")
 def web_search_tool(query: str) -> str:
     """Search the public web for current information or general knowledge.
     Use for questions about current events, general topics, definitions,

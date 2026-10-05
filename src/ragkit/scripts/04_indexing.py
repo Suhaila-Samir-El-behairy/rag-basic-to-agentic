@@ -14,7 +14,7 @@ import argparse
 import sys
 import warnings
 
-from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import (
@@ -23,12 +23,13 @@ from langchain_text_splitters import (
     TokenTextSplitter,
 )
 
-from ragkit.config import CHROMA_DIR
 from ragkit.utils import (
     format_docs,
     get_embeddings,
     get_llm,
+    get_vectorstore,
     load_web,
+    split_docs,
 )
 
 # Suppress the noisy semantic chunker warning
@@ -68,14 +69,7 @@ def chunk_by_strategy(docs, strategy: str, embeddings):
 
 def basic_strategy_index(splits, strategy: str, embeddings):
     """Build a simple vector store from chunks."""
-    persist_dir = CHROMA_DIR / f"04_{strategy}"
-    if (persist_dir / "chroma.sqlite3").exists():
-        return Chroma(persist_directory=str(persist_dir), embedding_function=embeddings)
-    return Chroma.from_documents(
-        documents=splits,
-        embedding=embeddings,
-        persist_directory=str(persist_dir),
-    )
+    return get_vectorstore(splits, name=f"04_{strategy}", embeddings=embeddings)
 
 
 # ============================================================
@@ -83,10 +77,28 @@ def basic_strategy_index(splits, strategy: str, embeddings):
 # ============================================================
 def multi_representation_index(docs, question: str, embeddings) -> str:
     """Store summaries, retrieve full docs that match the summary."""
-    persist_dir = CHROMA_DIR / "04_multi_rep"
+    # The web loader returns the whole post as a single document: split it into
+    # large "parent" chunks so each summary call fits in the LLM's token limits.
+    docs = split_docs(docs, chunk_size=4000, chunk_overlap=0)
 
-    # Step 1: generate summaries
-    print("  Generating summaries for each doc (one LLM call per doc)...", file=sys.stderr)
+    summary_vs = get_vectorstore([], name="04_multi_rep", embeddings=embeddings)
+    if not summary_vs.get(limit=1)["ids"]:
+        summary_vs.add_documents(_summarize(docs))
+
+    # Retrieve summaries, return the full parent chunks they point to
+    retrieved_summaries = summary_vs.similarity_search(question, k=3)
+    full_docs = [docs[int(r.metadata["doc_id"])] for r in retrieved_summaries]
+
+    print(
+        f"  Matched {len(retrieved_summaries)} summaries → returning {len(full_docs)} full docs",
+        file=sys.stderr,
+    )
+    return full_docs
+
+
+def _summarize(docs) -> list[Document]:
+    """One LLM summary per doc, tagged with the index of the doc it summarizes."""
+    print(f"  Generating summaries for {len(docs)} docs (one LLM call each)...", file=sys.stderr)
     summary_prompt = ChatPromptTemplate.from_template(
         """Summarize the following document in 2-3 sentences.
         Focus on the main topic and key technical concepts.
@@ -103,27 +115,7 @@ def multi_representation_index(docs, question: str, embeddings) -> str:
         {"max_concurrency": 3},
     )
     print(f"  Generated {len(summaries)} summaries", file=sys.stderr)
-
-    # Step 2: build (or load) summary vector store
-    if (persist_dir / "chroma.sqlite3").exists():
-        summary_vs = Chroma(persist_directory=str(persist_dir), embedding_function=embeddings)
-    else:
-        summary_vs = Chroma.from_texts(
-            texts=summaries,
-            embedding=embeddings,
-            metadatas=[{"doc_id": i} for i in range(len(docs))],
-            persist_directory=str(persist_dir),
-        )
-
-    # Step 3: retrieve summaries, return full docs
-    retrieved_summaries = summary_vs.similarity_search(question, k=3)
-    full_docs = [docs[int(r.metadata["doc_id"])] for r in retrieved_summaries]
-
-    print(
-        f"  Matched {len(retrieved_summaries)} summaries → returning {len(full_docs)} full docs",
-        file=sys.stderr,
-    )
-    return full_docs
+    return [Document(page_content=s, metadata={"doc_id": i}) for i, s in enumerate(summaries)]
 
 
 # ============================================================
