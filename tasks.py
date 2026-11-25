@@ -26,8 +26,9 @@ def test(c):
 
 @task
 def lint(c):
-    """Run ruff linter."""
+    """Run ruff linter + mypy."""
     c.run("ruff check src tests")
+    c.run("mypy src")
 
 
 @task
@@ -42,7 +43,6 @@ def clean(c):
     c.run("find . -type d -name __pycache__ -exec rm -rf {} +", warn=True)
     c.run("find . -type f -name '*.pyc' -delete", warn=True)
     c.run("rm -rf chroma_db .pytest_cache .ruff_cache .mypy_cache", warn=True)
-    c.run("rm -f bm25_cache*.pkl", warn=True)
 
 
 @task(help={"n": "Script number, e.g. 01", "q": "Question", "e": "Extra script flags"})
@@ -54,7 +54,24 @@ def run(c, n, q, e=""):
     c.run(f"{shlex.quote(sys.executable)} main.py {n} --question {shlex.quote(q)} {e}")
 
 
+@task(
+    help={
+        "p": "Pipelines (space-separated), 'default' or 'all'",
+        "limit": "Only the first N questions",
+        "run_id": "Run directory name under results/ (resumes if it exists)",
+    }
+)
+def eval(c, p="default", limit=0, run_id=""):  # noqa: A001 - task name used as `inv eval`
+    """Benchmark pipelines on the QA set. Example: inv eval -p "01:basic 07:agent" -l 5"""
+    cmd = f"{shlex.quote(sys.executable)} main.py eval --pipelines {p}"
+    if limit:
+        cmd += f" --limit {int(limit)}"
+    if run_id:
+        cmd += f" --run-id {shlex.quote(run_id)}"
+    c.run(cmd, pty=False)
+
+
 @task
-def install_optional(c):
-    """Install invoke itself."""
-    c.run("pip install invoke")
+def eval_check(c):
+    """Check that every gold-evidence phrase occurs in the corpus."""
+    c.run(f"{shlex.quote(sys.executable)} main.py eval-check")

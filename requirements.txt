@@ -1,23 +1,24 @@
 # Mirrors [project.dependencies] in pyproject.toml.
-# Preferred install: pip install -e ".[dev]"
+# Preferred install: pip install -e ".[dev]"   (add ",eval" for plots + HF datasets)
 
-# Core orchestration
-langchain>=0.3.0
-langchain-community>=0.3.0
-langchain-core>=0.3.0
-langchain-chroma>=0.1.0
-langchain-classic>=0.1.0
+# Core orchestration (create_agent and langchain-classic need the 1.x line)
+langchain>=1.0,<2
+langchain-community>=0.4,<1
+langchain-core>=1.0,<2
+langchain-chroma>=1.0
+langchain-classic>=1.0,<2
 langchain-experimental>=0.3.0
-langgraph>=0.2.0
+langgraph>=1.0,<2
 chromadb>=0.5.0
 networkx>=3.0
+numpy>=1.26
 
 # Free LLM provider (pick one or both)
-langchain-groq>=0.2.0                # primary recommendation
+langchain-groq>=1.0                  # primary recommendation
 # langchain-google-genai>=2.0.0       # alternative free tier
 
 # Free embeddings via HuggingFace Inference API
-langchain-huggingface>=0.1.0
+langchain-huggingface>=1.0
 huggingface-hub>=0.25.0
 
 # Free reranking + keyword retrieval
@@ -33,6 +34,5 @@ pypdf>=5.0.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 arxiv>=2.1.0
-wikipedia>=1.4.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
