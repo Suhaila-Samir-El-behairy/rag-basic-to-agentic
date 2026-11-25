@@ -3,30 +3,38 @@
 ```mermaid
 flowchart TB
     Start([Start]) --> R[retrieve]
-    R -->|docs relevant| G[generate]
-    R -->|docs not relevant| W[rewrite]
+    R --> GD[grade_documents]
+    GD -->|relevant / out of retries| G[generate]
+    GD -->|not relevant| W[rewrite query]
     W --> R
-    G -->|grounded + answers| End([End])
-    G -->|hallucinated| G
-    G -->|doesn't answer| W
-    G -->|max retries| End
+    G --> GG[grade_generation]
+    GG -->|grounded + answers| End([End])
+    GG -->|hallucinated| G
+    GG -->|doesn't answer| W
+    GG -->|max retries| End
+```
 
 Flow:
-  1. Retrieve docs
-  2. Grade docs - if not relevant, rewrite question and retry
-  3. Generate answer from docs
-  4. Grade for hallucinations → if hallucinated, regenerate
-  5. Grade for answer quality → if not addressing question, rewrite and retry
+  1. Retrieve docs for the current *search query*
+  2. Grade docs - if not relevant, rewrite the search query and retry
+  3. Generate an answer to the user's *original* question
+  4. Grade for hallucinations -> if hallucinated, regenerate with a stricter prompt
+  5. Grade for answer quality -> if it doesn't address the question, rewrite and retry
   6. End when grounded + answers question, or after MAX_RETRIES
      (rewrites and regenerations are capped independently, so the graph
      always terminates)
 
-Built with LangGraph for explicit stateful control flow.
+The rewriter only changes the search query. Generation and answer grading always
+use the original question, so a rewrite can't make the graph answer (and grade
+itself against) a different question than the user asked.
+
+Graders run as their own nodes (not inside edge functions), so every grade is a
+visible step in LangSmith traces and is stored in the state.
 """
 
 import argparse
-import pickle
 import sys
+from functools import lru_cache
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -34,22 +42,16 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
-from ragkit.config import CHROMA_DIR
-from ragkit.utils import (
-    format_docs,
-    get_llm,
-    get_vectorstore,
-    load_web,
-    split_docs,
-)
+from ragkit.corpus import default_retriever
+from ragkit.pipeline import RAGResult
+from ragkit.utils import format_docs, get_llm
 
-URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
 MAX_RETRIES = 2
-BM25_CACHE = CHROMA_DIR / "splits_06.pkl"
+RETRY_TEMPERATURE = 0.7  # temperature 0 would regenerate the exact same hallucination
 
 
 # ============================================================
-# Graders (structured output via Groq function calling)
+# Graders (structured output via function calling)
 # ============================================================
 class GradeDocuments(BaseModel):
     binary_score: str = Field(description="'yes' if relevant, 'no' if not")
@@ -111,38 +113,49 @@ Output ONLY 'yes' or 'no'."""
 
 def build_rewriter():
     prompt = ChatPromptTemplate.from_template(
-        """You are rephrasing a question for better document retrieval.
+        """You are rephrasing a search query for better document retrieval.
 
-Original question: {question}
+User question: {question}
+Previous search query: {query}
 
-Write a clearer, more specific version that will retrieve more relevant documents.
-Output ONLY the rewritten question, no preamble."""
+Write a clearer, more specific search query that will retrieve more relevant
+documents for the user question. Output ONLY the new query, no preamble."""
     )
     return prompt | get_llm() | StrOutputParser()
 
 
-def build_rag_chain():
-    prompt = ChatPromptTemplate.from_template(
-        """Answer the question based ONLY on the following context.
-If the context is insufficient, say "I don't have enough information."
-
+RAG_TEMPLATE = """Answer the question based ONLY on the following context.
+If the context is insufficient, say "I don't know."
+{extra}
 Context:
 {context}
 
 Question: {question}
 Answer:"""
-    )
-    return prompt | get_llm() | StrOutputParser()
+
+STRICT_NOTE = (
+    "\nA previous answer contained claims that are not in the context. Only state "
+    "facts that appear in the context; leave out anything you cannot support.\n"
+)
+
+
+def build_rag_chain(temperature: float = 0):
+    prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
+    return prompt | get_llm(temperature=temperature) | StrOutputParser()
 
 
 # ============================================================
 # Graph state
 # ============================================================
-class GraphState(TypedDict):
-    question: str
+class GraphState(TypedDict, total=False):
+    original_question: str  # what the user asked; never rewritten
+    question: str  # current search query (rewritten on retry)
     generation: str
     documents: list
-    retries: int  # number of question rewrites so far
+    docs_relevant: bool
+    grounded: bool
+    answers: bool
+    retries: int  # number of query rewrites so far
     generations: int  # number of answers generated so far
 
 
@@ -151,25 +164,44 @@ def is_yes(score) -> bool:
     return score.binary_score.strip().lower().startswith("yes")
 
 
+def _asked(state) -> str:
+    return state.get("original_question") or state["question"]
+
+
 # ============================================================
-# Node functions (do work, return state update)
+# Nodes (do work, return a state update)
 # ============================================================
 def make_retrieve(retriever):
     def retrieve(state):
         print(f"  [retrieve] Getting docs for: {state['question'][:80]}", file=sys.stderr)
-        documents = retriever.invoke(state["question"])
-        return {"documents": documents}
+        return {"documents": retriever.invoke(state["question"])}
 
     return retrieve
 
 
-def make_generate(rag_chain):
+def make_grade_documents(doc_grader):
+    def grade_documents(state):
+        score = doc_grader.invoke(
+            {"question": _asked(state), "documents": format_docs(state["documents"])}
+        )
+        return {"docs_relevant": is_yes(score)}
+
+    return grade_documents
+
+
+def make_generate(rag_chain, retry_chain):
     def generate(state):
-        print("  [generate] Producing answer...", file=sys.stderr)
-        generation = rag_chain.invoke(
+        # Regenerating after a failed groundedness check: be stricter and sample,
+        # otherwise a temperature-0 model reproduces the same answer.
+        retrying = state.get("grounded") is False
+        suffix = " (strict retry)" if retrying else ""
+        print(f"  [generate] Producing answer{suffix}...", file=sys.stderr)
+        chain = retry_chain if retrying else rag_chain
+        generation = chain.invoke(
             {
                 "context": format_docs(state["documents"]),
-                "question": state["question"],
+                "question": _asked(state),
+                "extra": STRICT_NOTE if retrying else "",
             }
         )
         return {"generation": generation, "generations": state.get("generations", 0) + 1}
@@ -177,155 +209,132 @@ def make_generate(rag_chain):
     return generate
 
 
+def make_grade_generation(hallucination_grader, answer_grader):
+    def grade_generation(state):
+        h_score = hallucination_grader.invoke(
+            {"documents": format_docs(state["documents"]), "generation": state["generation"]}
+        )
+        if not is_yes(h_score):
+            return {"grounded": False, "answers": False}
+        a_score = answer_grader.invoke(
+            {"question": _asked(state), "generation": state["generation"]}
+        )
+        return {"grounded": True, "answers": is_yes(a_score)}
+
+    return grade_generation
+
+
 def make_rewrite(rewriter):
     def rewrite(state):
-        print("  [rewrite] Rephrasing question...", file=sys.stderr)
-        new_q = rewriter.invoke({"question": state["question"]})
+        print("  [rewrite] Rephrasing search query...", file=sys.stderr)
+        new_q = rewriter.invoke({"question": _asked(state), "query": state["question"]})
         print(f"    → {new_q[:100]}", file=sys.stderr)
-        return {
-            "question": new_q,
-            "retries": state.get("retries", 0) + 1,
-        }
+        # Reset the generation verdict so the next answer starts from the normal prompt.
+        return {"question": new_q, "retries": state.get("retries", 0) + 1, "grounded": None}
 
     return rewrite
 
 
 # ============================================================
-# Routing functions (decide next node, no state changes)
+# Routing (read the grades, no LLM calls, no state changes)
 # ============================================================
-def make_route_after_retrieve(doc_grader):
-    def route_after_retrieve(state):
-        score = doc_grader.invoke(
-            {
-                "question": state["question"],
-                "documents": format_docs(state["documents"]),
-            }
-        )
-        if is_yes(score):
-            print("  [route] docs relevant → generate", file=sys.stderr)
-            return "generate"
-        if state.get("retries", 0) >= MAX_RETRIES:
-            print("  [route] docs not relevant, no retries left → generate", file=sys.stderr)
-            return "generate"
-        print("  [route] docs not relevant → rewrite", file=sys.stderr)
-        return "rewrite"
-
-    return route_after_retrieve
+def route_after_grade_documents(state):
+    if state["docs_relevant"]:
+        print("  [route] docs relevant → generate", file=sys.stderr)
+        return "generate"
+    if state.get("retries", 0) >= MAX_RETRIES:
+        print("  [route] docs not relevant, no retries left → generate", file=sys.stderr)
+        return "generate"
+    print("  [route] docs not relevant → rewrite", file=sys.stderr)
+    return "rewrite"
 
 
-def make_route_after_generate(hallucination_grader, answer_grader):
-    def route_after_generate(state):
-        retries = state.get("retries", 0)
-        regenerations = state.get("generations", 1) - 1
-
-        # Check hallucination first
-        h_score = hallucination_grader.invoke(
-            {
-                "documents": format_docs(state["documents"]),
-                "generation": state["generation"],
-            }
-        )
-        if not is_yes(h_score):
-            print(f"  [route] hallucinated (regeneration {regenerations})", file=sys.stderr)
-            return "generate" if regenerations < MAX_RETRIES else "end"
-
-        # Then check answer quality
-        a_score = answer_grader.invoke(
-            {
-                "question": state["question"],
-                "generation": state["generation"],
-            }
-        )
-        if not is_yes(a_score):
-            print(f"  [route] doesn't answer (retry {retries})", file=sys.stderr)
-            return "rewrite" if retries < MAX_RETRIES else "end"
-
-        print("  [route] grounded + answers → end", file=sys.stderr)
-        return "end"
-
-    return route_after_generate
+def route_after_grade_generation(state):
+    retries = state.get("retries", 0)
+    regenerations = state.get("generations", 1) - 1
+    if not state["grounded"]:
+        print(f"  [route] hallucinated (regeneration {regenerations})", file=sys.stderr)
+        return "generate" if regenerations < MAX_RETRIES else "end"
+    if not state["answers"]:
+        print(f"  [route] doesn't answer (retry {retries})", file=sys.stderr)
+        return "rewrite" if retries < MAX_RETRIES else "end"
+    print("  [route] grounded + answers → end", file=sys.stderr)
+    return "end"
 
 
 # ============================================================
 # Build the graph
 # ============================================================
-def build_graph():
-    print(f"\n[setup] Loading + indexing {URL}...", file=sys.stderr)
-    if BM25_CACHE.exists():
-        splits = pickle.load(open(BM25_CACHE, "rb"))
-        print(f"  Loaded {len(splits)} cached splits", file=sys.stderr)
-    else:
-        docs = load_web(URL)
-        splits = split_docs(docs)
-        pickle.dump(splits, open(BM25_CACHE, "wb"))
-        print(f"  Indexed {len(splits)} chunks", file=sys.stderr)
-
-    vectorstore = get_vectorstore(splits, name="06_self_reflection")
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-    print("[setup] Building graders + chains...", file=sys.stderr)
-    doc_grader = build_doc_grader()
-    hallucination_grader = build_hallucination_grader()
-    answer_grader = build_answer_grader()
-    rewriter = build_rewriter()
-    rag_chain = build_rag_chain()
-
-    # Nodes
-    retrieve = make_retrieve(retriever)
-    generate = make_generate(rag_chain)
-    rewrite = make_rewrite(rewriter)
-
-    # Routing functions
-    route_after_retrieve = make_route_after_retrieve(doc_grader)
-    route_after_generate = make_route_after_generate(hallucination_grader, answer_grader)
+def build_graph(retriever=None):
+    retriever = retriever or default_retriever()
 
     workflow = StateGraph(GraphState)
-
-    workflow.add_node("retrieve", retrieve)
-    workflow.add_node("generate", generate)
-    workflow.add_node("rewrite", rewrite)
+    workflow.add_node("retrieve", make_retrieve(retriever))
+    workflow.add_node("grade_documents", make_grade_documents(build_doc_grader()))
+    workflow.add_node(
+        "generate", make_generate(build_rag_chain(), build_rag_chain(RETRY_TEMPERATURE))
+    )
+    workflow.add_node(
+        "grade_generation",
+        make_grade_generation(build_hallucination_grader(), build_answer_grader()),
+    )
+    workflow.add_node("rewrite", make_rewrite(build_rewriter()))
 
     workflow.set_entry_point("retrieve")
-
+    workflow.add_edge("retrieve", "grade_documents")
     workflow.add_conditional_edges(
-        "retrieve",
-        route_after_retrieve,
+        "grade_documents",
+        route_after_grade_documents,
         {"generate": "generate", "rewrite": "rewrite"},
     )
-
     workflow.add_edge("rewrite", "retrieve")
-
+    workflow.add_edge("generate", "grade_generation")
     workflow.add_conditional_edges(
-        "generate",
-        route_after_generate,
+        "grade_generation",
+        route_after_grade_generation,
         {"generate": "generate", "rewrite": "rewrite", "end": END},
     )
-
     return workflow.compile()
+
+
+def initial_state(question: str) -> GraphState:
+    return {"original_question": question, "question": question, "retries": 0, "generations": 0}
+
+
+@lru_cache(maxsize=1)
+def _app():
+    return build_graph()
+
+
+def run(question: str) -> RAGResult:
+    result = _app().invoke(initial_state(question))
+    return RAGResult(
+        answer=result.get("generation", ""),
+        contexts=[d.page_content for d in result.get("documents", [])],
+        metadata={
+            "rewrites": result.get("retries", 0),
+            "generations": result.get("generations", 0),
+            "final_query": result.get("question"),
+            "grounded": result.get("grounded"),
+            "answers": result.get("answers"),
+        },
+    )
 
 
 # ============================================================
 # CLI entry point
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="Self-reflection RAG with self-grading (Groq + LangGraph)"
-    )
+    parser = argparse.ArgumentParser(description="Self-reflection RAG with self-grading")
     parser.add_argument("--question", required=True)
     args = parser.parse_args()
 
-    print("\n[graph] Compiling self-reflection graph...", file=sys.stderr)
-    app = build_graph()
-
     print(f"\n[run] Question: {args.question}\n", file=sys.stderr)
+    result = run(args.question)
     print("=" * 60)
-    result = app.invoke({"question": args.question, "retries": 0, "generations": 0})
-
-    if result.get("generation"):
-        print(result["generation"])
-    else:
-        print("(No generation produced)")
+    print(result.answer or "(No generation produced)")
     print("=" * 60)
+    print(f"[trace] {result.metadata}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -4,10 +4,10 @@ Strategies:
   - recursive: default, splits on a hierarchy of separators
   - character: simple character-based splitting
   - token:     splits on token count (LLM-aware boundaries)
-  - semantic:  splits based on embedding similarity between chunks
+  - semantic:  splits based on embedding similarity between sentences
   - multi-rep: stores summaries, returns full original docs on retrieval
 
-The script indexes once per strategy, then lets you query it.
+The script indexes once per strategy (persisted), then lets you query it.
 """
 
 import argparse
@@ -23,19 +23,14 @@ from langchain_text_splitters import (
     TokenTextSplitter,
 )
 
-from ragkit.utils import (
-    format_docs,
-    get_embeddings,
-    get_llm,
-    get_vectorstore,
-    load_web,
-    split_docs,
-)
+from ragkit import corpus
+from ragkit.pipeline import RAGResult
+from ragkit.utils import generate_answer, get_embeddings, get_llm, get_vectorstore, split_docs
 
 # Suppress the noisy semantic chunker warning
 warnings.filterwarnings("ignore", category=UserWarning, module="langchain_experimental")
 
-URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
+STRATEGIES = ["recursive", "character", "token", "semantic", "multi-rep"]
 
 
 # ============================================================
@@ -48,34 +43,45 @@ def chunk_by_strategy(docs, strategy: str, embeddings):
         return splitter.split_documents(docs), "Recursive character splitting"
 
     if strategy == "character":
-        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200, separator="\n")
-        return splitter.split_documents(docs), "Character splitting (single separator)"
+        char_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200, separator="\n")
+        return char_splitter.split_documents(docs), "Character splitting (single separator)"
 
     if strategy == "token":
-        splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=50)
-        return splitter.split_documents(docs), "Token-based splitting (512 tokens)"
+        token_splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=50)
+        return token_splitter.split_documents(docs), "Token-based splitting (512 tokens)"
 
     if strategy == "semantic":
         from langchain_experimental.text_splitter import SemanticChunker
 
-        splitter = SemanticChunker(
-            embeddings,
-            breakpoint_threshold_type="percentile",
+        print(
+            "  Note: semantic chunking embeds every sentence; on the free HF tier this "
+            "can take a few minutes and is retried with backoff on rate limits.",
+            file=sys.stderr,
         )
-        return splitter.split_documents(docs), "Semantic chunking (embedding similarity)"
+        semantic_splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
+        return semantic_splitter.split_documents(docs), "Semantic chunking (embedding similarity)"
 
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def basic_strategy_index(splits, strategy: str, embeddings):
-    """Build a simple vector store from chunks."""
-    return get_vectorstore(splits, name=f"04_{strategy}", embeddings=embeddings)
+def basic_strategy_index(docs, strategy: str, embeddings):
+    """Build (or load) a vector store for one chunking strategy.
+
+    Chunking only runs when the store is empty: the semantic splitter costs one
+    embedding call per sentence, which must not be paid on every query.
+    """
+    store = get_vectorstore([], name=f"04_{strategy}", embeddings=embeddings)
+    if not store.get(limit=1)["ids"]:
+        splits, description = chunk_by_strategy(docs, strategy, embeddings)
+        print(f"  {description}: {len(splits)} chunks", file=sys.stderr)
+        store.add_documents(splits)
+    return store
 
 
 # ============================================================
 # Multi-representation indexing
 # ============================================================
-def multi_representation_index(docs, question: str, embeddings) -> str:
+def multi_representation_index(docs, question: str, embeddings, k: int = 3) -> list[Document]:
     """Store summaries, retrieve full docs that match the summary."""
     # The web loader returns the whole post as a single document: split it into
     # large "parent" chunks so each summary call fits in the LLM's token limits.
@@ -86,7 +92,7 @@ def multi_representation_index(docs, question: str, embeddings) -> str:
         summary_vs.add_documents(_summarize(docs))
 
     # Retrieve summaries, return the full parent chunks they point to
-    retrieved_summaries = summary_vs.similarity_search(question, k=3)
+    retrieved_summaries = summary_vs.similarity_search(question, k=k)
     full_docs = [docs[int(r.metadata["doc_id"])] for r in retrieved_summaries]
 
     print(
@@ -118,32 +124,35 @@ def _summarize(docs) -> list[Document]:
     return [Document(page_content=s, metadata={"doc_id": i}) for i, s in enumerate(summaries)]
 
 
-# ============================================================
-# Final answer generation
-# ============================================================
-def generate_answer(question: str, docs) -> str:
-    prompt = ChatPromptTemplate.from_template(
-        """Answer the question based ONLY on the context below.
+def size_stats(docs) -> str:
+    sizes = [len(d.page_content) for d in docs]
+    if not sizes:
+        return "no chunks retrieved (is the index empty?)"
+    return f"min={min(sizes)}, max={max(sizes)}, avg={sum(sizes) // len(sizes)}"
 
-Context:
-{context}
 
-Question: {question}
+def run(question: str, strategy: str = "recursive", k: int = 4) -> RAGResult:
+    docs = corpus.load_docs()
+    embeddings = get_embeddings()
 
-Answer:"""
+    if strategy == "multi-rep":
+        retrieved = multi_representation_index(docs, question, embeddings)
+    else:
+        store = basic_strategy_index(docs, strategy, embeddings)
+        retrieved = store.as_retriever(search_kwargs={"k": k}).invoke(question)
+
+    return RAGResult(
+        answer=generate_answer(question, retrieved),
+        contexts=[d.page_content for d in retrieved],
+        metadata={"strategy": strategy, "chunk_sizes": size_stats(retrieved)},
     )
-    chain = prompt | get_llm() | StrOutputParser()
-    return chain.invoke({"context": format_docs(docs), "question": question})
 
 
 # ============================================================
 # CLI entry point
 # ============================================================
-STRATEGIES = ["recursive", "character", "token", "semantic", "multi-rep"]
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Compare indexing strategies (Groq + HuggingFace)")
+    parser = argparse.ArgumentParser(description="Compare indexing strategies")
     parser.add_argument("--question", required=True)
     parser.add_argument(
         "--strategy",
@@ -153,44 +162,12 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"\n[setup] Loading {URL}...", file=sys.stderr)
-    docs = load_web(URL)
-    embeddings = get_embeddings()
-
     print(f"\n[index] Strategy: {args.strategy}", file=sys.stderr)
+    result = run(args.question, strategy=args.strategy)
+    print(f"  Retrieved chunk sizes: {result.metadata['chunk_sizes']}", file=sys.stderr)
 
-    if args.strategy == "multi-rep":
-        full_docs = multi_representation_index(docs, args.question, embeddings)
-        print("\n[generate] Producing final answer...\n", file=sys.stderr)
-        print("=" * 60)
-        print(generate_answer(args.question, full_docs))
-        print("=" * 60)
-        return
-
-    # For the 4 chunking strategies
-    splits, description = chunk_by_strategy(docs, args.strategy, embeddings)
-    print(f"  Description: {description}", file=sys.stderr)
-    print(f"  Produced {len(splits)} chunks", file=sys.stderr)
-
-    print(
-        f"  Building vector store (persisted to chroma_db/04_{args.strategy}/)...", file=sys.stderr
-    )
-    vectorstore = basic_strategy_index(splits, args.strategy, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-    print(f"\n[retrieve] Fetching top-4 chunks for: {args.question}", file=sys.stderr)
-    retrieved = retriever.invoke(args.question)
-
-    # Show chunk size distribution
-    sizes = [len(d.page_content) for d in retrieved]
-    print(
-        f"  Chunk sizes: min={min(sizes)}, max={max(sizes)}, avg={sum(sizes) // len(sizes)}",
-        file=sys.stderr,
-    )
-
-    print("\n[generate] Producing final answer...\n", file=sys.stderr)
     print("=" * 60)
-    print(generate_answer(args.question, retrieved))
+    print(result.answer)
     print("=" * 60)
 
 

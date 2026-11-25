@@ -1,40 +1,59 @@
-"""Graph RAG - simplified implementation using NetworkX.
+"""Graph RAG (local search) with an in-memory NetworkX knowledge graph.
 
-Based on: Edge et al. (2024) "From Local to Global: A Graph RAG Approach
-to Query-Focused Summarization"
-Paper: https://arxiv.org/abs/2404.16130
+Inspired by Edge et al. (2024) "From Local to Global: A Graph RAG Approach to
+Query-Focused Summarization", https://arxiv.org/abs/2404.16130
 
-The key idea: build a knowledge graph from the document (entities +
-relationships), then answer questions by traversing the graph.
+What this implements: the *local search* pattern. An LLM extracts entities and
+relationships from every chunk into a graph. Each entity remembers the chunks it
+came from. At query time we match question terms to entities, take their k-hop
+neighbourhood (following edges in both directions), and answer from the
+neighbourhood's triples plus the source chunks of the matched entities.
 
-This is a simplified, in-memory version using NetworkX (no Neo4j).
-Microsoft's full GraphRAG library does community detection, hierarchical
-summarization, etc. - this version shows the core pattern in ~150 lines.
-
-Best for: questions that require understanding relationships between
-concepts across the document ("how does X relate to Y", "what enables Z").
+What it does not implement: Microsoft GraphRAG's community detection and
+hierarchical community summaries (the "global search" used for corpus-wide
+questions). Matching entities to questions is lexical, not embedding-based.
 """
 
 import argparse
 import pickle
 import sys
+from collections import Counter
+from functools import lru_cache
 
 import networkx as nx
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
-from ragkit.config import CHROMA_DIR
-from ragkit.utils import (
-    get_llm,
-    load_web,
-    split_docs,
-)
+from ragkit import config, corpus
+from ragkit.pipeline import RAGResult
+from ragkit.utils import generate_answer, get_llm
 
-URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
-GRAPH_FILE = CHROMA_DIR / "09_graph.pkl"
+GRAPH_VERSION = 2  # bump when the cached graph format changes
 # Question words that would otherwise substring-match unrelated entity names
-STOPWORDS = {"what", "which", "when", "where", "does", "with", "from", "that", "this", "have"}
+STOPWORDS = {
+    "what",
+    "which",
+    "when",
+    "where",
+    "does",
+    "with",
+    "from",
+    "that",
+    "this",
+    "have",
+    "how",
+    "why",
+    "who",
+    "about",
+    "between",
+    "used",
+    "uses",
+}
+MAX_SOURCE_CHUNKS = 3
+
+
+def graph_file():
+    return config.CHROMA_DIR / f"09_graph_v{GRAPH_VERSION}.pkl"
 
 
 # ---------- Entity extraction ----------
@@ -67,48 +86,73 @@ Respond with JSON containing:
 - "entities": list of {{"name": "...", "type": "CONCEPT|METHOD|TOOL|PERSON|METRIC"}}
 - "relationships": list of {{"source": "...", "target": "...", "relation": "..."}}
 
+Use exactly the same entity names in relationships as in the entity list.
 Limit to the 3-5 most important entities and 2-4 most important relationships per chunk."""
     )
     return prompt | get_llm().with_structured_output(ExtractionResult)
 
 
+def normalize(name: str) -> str:
+    """Canonical node id: 'ReAct ', 'react' and 'REACT' are the same entity."""
+    return " ".join(name.casefold().split())
+
+
 # ---------- Graph construction ----------
-def build_graph(chunks):
+def _add_entity(graph, name: str, etype: str, chunk_id: int):
+    key = normalize(name)
+    if not key:
+        return None
+    if key not in graph:
+        graph.add_node(key, name=name.strip(), type=etype, chunks=set())
+    elif graph.nodes[key].get("type") == "UNKNOWN" and etype != "UNKNOWN":
+        graph.nodes[key]["type"] = etype
+    graph.nodes[key]["chunks"].add(chunk_id)
+    return key
+
+
+def add_extraction(graph, result: ExtractionResult, chunk_id: int) -> None:
+    """Merge one chunk's extraction into the graph."""
+    for entity in result.entities:
+        _add_entity(graph, entity.name, entity.type, chunk_id)
+    for rel in result.relationships:
+        # An endpoint missing from the entity list is still an entity: keep the edge.
+        src = _add_entity(graph, rel.source, "UNKNOWN", chunk_id)
+        dst = _add_entity(graph, rel.target, "UNKNOWN", chunk_id)
+        if src and dst and src != dst:
+            graph.add_edge(src, dst, relation=rel.relation, chunk=chunk_id)
+
+
+def build_graph(chunks, extractor=None):
     """Extract entities/relationships from each chunk and merge into a graph."""
-    graph = nx.MultiDiGraph()
-    extractor = build_extractor()
+    graph = nx.MultiDiGraph(chunks=[c.page_content for c in chunks])
+    extractor = extractor or build_extractor()
 
     print(f"  Extracting entities from {len(chunks)} chunks...", file=sys.stderr)
-    for i, chunk in enumerate(chunks):
-        if i % 5 == 0:
-            print(f"    Processing chunk {i + 1}/{len(chunks)}...", file=sys.stderr)
-        try:
-            result = extractor.invoke({"text": chunk.page_content[:3000]})
-            for entity in result.entities:
-                if not graph.has_node(entity.name):
-                    graph.add_node(entity.name, type=entity.type)
-            for rel in result.relationships:
-                if graph.has_node(rel.source) and graph.has_node(rel.target):
-                    graph.add_edge(rel.source, rel.target, relation=rel.relation)
-        except Exception as e:
-            print(f"    Chunk {i + 1} extraction failed: {e}", file=sys.stderr)
+    results = extractor.batch(
+        [{"text": c.page_content[:3000]} for c in chunks],
+        {"max_concurrency": 3},
+        return_exceptions=True,
+    )
+    for i, result in enumerate(results):
+        if isinstance(result, Exception) or result is None:
+            print(f"    Chunk {i + 1} extraction failed: {result}", file=sys.stderr)
             continue
-
+        add_extraction(graph, result, i)
     return graph
 
 
-def setup_graph():
-    if GRAPH_FILE.exists():
-        print(f"  Loading cached graph from {GRAPH_FILE}", file=sys.stderr)
-        return pickle.load(open(GRAPH_FILE, "rb"))
+def setup_graph(rebuild: bool = False):
+    path = graph_file()
+    if path.exists() and not rebuild:
+        print(f"  Loading cached graph from {path}", file=sys.stderr)
+        with path.open("rb") as f:
+            return pickle.load(f)  # noqa: S301 - local cache written by this module
 
     print("  Building knowledge graph (one-time per document)...", file=sys.stderr)
-    docs = load_web(URL)
-    chunks = split_docs(docs)
-    graph = build_graph(chunks)
-
-    GRAPH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    pickle.dump(graph, open(GRAPH_FILE, "wb"))
+    graph = build_graph(corpus.load_splits())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        pickle.dump(graph, f)
     print(
         f"  Graph: {graph.number_of_nodes()} entities, {graph.number_of_edges()} relationships",
         file=sys.stderr,
@@ -117,103 +161,96 @@ def setup_graph():
 
 
 # ---------- Graph query ----------
-def find_relevant_subgraph(graph, question, k_hops=2):
-    """Find entities relevant to the question and extract k-hop neighborhood."""
-    # Simple keyword matching first
-    question_words = [
+def question_terms(question: str) -> list[str]:
+    return [
         w
-        for w in (t.strip("?.,!;:\"'") for t in question.lower().split())
+        for w in (t.strip("?.,!;:\"'()") for t in question.lower().split())
         if len(w) > 3 and w not in STOPWORDS
     ]
-    matching = [n for n in graph.nodes() if any(w in n.lower() for w in question_words)]
+
+
+def find_relevant_subgraph(graph, question, k_hops=2):
+    """Find entities relevant to the question and extract their k-hop neighborhood.
+
+    Edges are followed in both directions: "A --uses--> B" makes A relevant to a
+    question about B just as much as the other way round.
+    """
+    terms = question_terms(question)
+    matching = [n for n in graph.nodes() if any(w in str(n).lower() for w in terms)]
 
     if not matching:
         # Fallback: most connected nodes
-        matching = sorted(graph.nodes(), key=lambda n: graph.degree(n), reverse=True)[:5]
+        matching = sorted(graph.nodes(), key=graph.degree, reverse=True)[:5]
 
-    # Get k-hop neighborhood
+    undirected = graph.to_undirected(as_view=True)
     subgraph_nodes = set(matching)
     for node in matching:
-        try:
-            subgraph_nodes.update(
-                nx.single_source_shortest_path_length(graph, node, cutoff=k_hops).keys()
-            )
-        except nx.NetworkXError:
-            continue
+        subgraph_nodes.update(nx.single_source_shortest_path_length(undirected, node, k_hops))
 
     return graph.subgraph(subgraph_nodes).copy(), matching
+
+
+def source_chunks(graph, matched, limit: int = MAX_SOURCE_CHUNKS) -> list[str]:
+    """Chunks that mention the most matched entities (the text behind the triples)."""
+    texts = graph.graph.get("chunks", [])
+    counts = Counter(c for n in matched for c in graph.nodes[n].get("chunks", ()))
+    return [texts[c] for c, _ in counts.most_common(limit) if c < len(texts)]
 
 
 def graph_to_text(subgraph):
     """Convert graph to text context for the LLM."""
     lines = ["ENTITIES:"]
-    for node in subgraph.nodes(data=True):
-        lines.append(f"  - {node[0]} (type: {node[1].get('type', 'UNKNOWN')})")
+    for node, data in subgraph.nodes(data=True):
+        lines.append(f"  - {data.get('name', node)} (type: {data.get('type', 'UNKNOWN')})")
     lines.append("\nRELATIONSHIPS:")
     for u, v, data in subgraph.edges(data=True):
-        rel = data.get("relation", "related to")
-        lines.append(f"  - {u} --[{rel}]--> {v}")
+        name_u = subgraph.nodes[u].get("name", u)
+        name_v = subgraph.nodes[v].get("name", v)
+        lines.append(f"  - {name_u} --[{data.get('relation', 'related to')}]--> {name_v}")
     return "\n".join(lines)
+
+
+@lru_cache(maxsize=1)
+def _graph():
+    return setup_graph()
+
+
+def run(question: str, hops: int = 2, graph=None) -> RAGResult:
+    graph = graph if graph is not None else _graph()
+    subgraph, matched = find_relevant_subgraph(graph, question, k_hops=hops)
+    chunks = source_chunks(graph, matched)
+    graph_text = graph_to_text(subgraph)
+    context = f"Knowledge graph:\n{graph_text}\n\nSource passages:\n" + "\n\n".join(chunks)
+    return RAGResult(
+        answer=generate_answer(question, context),
+        contexts=[graph_text, *chunks],
+        metadata={
+            "matched_entities": [graph.nodes[n].get("name", n) for n in matched],
+            "subgraph_nodes": subgraph.number_of_nodes(),
+            "subgraph_edges": subgraph.number_of_edges(),
+        },
+    )
 
 
 # ---------- CLI ----------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Graph RAG using in-memory NetworkX (Groq-powered)"
-    )
+    parser = argparse.ArgumentParser(description="Graph RAG (local search) with NetworkX")
     parser.add_argument("--question", required=True)
-    parser.add_argument(
-        "--hops",
-        type=int,
-        default=2,
-        help="Number of hops for subgraph extraction (default 2)",
-    )
-    parser.add_argument(
-        "--rebuild",
-        action="store_true",
-        help="Rebuild the graph from scratch",
-    )
+    parser.add_argument("--hops", type=int, default=2, help="Subgraph radius (default 2)")
+    parser.add_argument("--rebuild", action="store_true", help="Rebuild the graph from scratch")
     args = parser.parse_args()
 
-    if args.rebuild and GRAPH_FILE.exists():
-        GRAPH_FILE.unlink()
-        print("[setup] Cleared cached graph.", file=sys.stderr)
-
-    print("\n[setup] Building/loading knowledge graph...", file=sys.stderr)
-    graph = setup_graph()
+    graph = setup_graph(rebuild=args.rebuild)
     print(
-        f"[setup] Total graph: {graph.number_of_nodes()} entities, {graph.number_of_edges()} relationships",
+        f"[setup] Graph: {graph.number_of_nodes()} entities, "
+        f"{graph.number_of_edges()} relationships",
         file=sys.stderr,
     )
-
-    # Find relevant subgraph
-    print(f"\n[query] {args.question}", file=sys.stderr)
-    subgraph, matched_nodes = find_relevant_subgraph(graph, args.question, k_hops=args.hops)
-    print(f"[graph] Matched entities: {matched_nodes}", file=sys.stderr)
-    print(
-        f"[graph] Subgraph: {subgraph.number_of_nodes()} nodes, {subgraph.number_of_edges()} edges",
-        file=sys.stderr,
-    )
-
-    # Convert to text context
-    context = graph_to_text(subgraph)
-
-    # Generate answer
-    prompt = ChatPromptTemplate.from_template(
-        """Answer the question based on the knowledge graph below.
-The graph contains entities and relationships extracted from the source document.
-
-Knowledge graph:
-{context}
-
-Question: {question}
-
-Answer:"""
-    )
-    chain = prompt | get_llm() | StrOutputParser()
+    result = run(args.question, hops=args.hops, graph=graph)
+    print(f"[graph] {result.metadata}", file=sys.stderr)
 
     print("\n" + "=" * 60)
-    print(chain.invoke({"context": context, "question": args.question}))
+    print(result.answer)
     print("=" * 60)
 
 

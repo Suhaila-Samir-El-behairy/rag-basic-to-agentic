@@ -1,46 +1,27 @@
-"""Basic RAG pipeline."""
+"""Basic RAG pipeline: load -> split -> embed -> retrieve -> generate."""
 
 import argparse
 
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-
-from ragkit.utils import format_docs, get_llm, get_vectorstore, load_web, split_docs
-
-URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
+from ragkit.corpus import default_retriever
+from ragkit.pipeline import RAGResult
+from ragkit.utils import generate_answer
 
 
-def build_chain():
-    docs = load_web(URL)
-    splits = split_docs(docs)
-    vectorstore = get_vectorstore(splits, name="01_basic")
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-    prompt = ChatPromptTemplate.from_template(
-        """Answer the question based only on the context:
-
-{context}
-
-Question: {question}"""
+def run(question: str, k: int = 4) -> RAGResult:
+    docs = default_retriever(k).invoke(question)
+    return RAGResult(
+        answer=generate_answer(question, docs),
+        contexts=[d.page_content for d in docs],
     )
-
-    chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | get_llm()
-        | StrOutputParser()
-    )
-    return chain
 
 
 def main():
     parser = argparse.ArgumentParser(description="Basic RAG")
     parser.add_argument("--question", required=True)
+    parser.add_argument("--k", type=int, default=4, help="Chunks to retrieve (default 4)")
     args = parser.parse_args()
 
-    chain = build_chain()
-    print(chain.invoke(args.question))
+    print(run(args.question, k=args.k).answer)
 
 
 if __name__ == "__main__":

@@ -8,9 +8,10 @@ def test_project_root_exists():
     assert config.PROJECT_ROOT.is_dir()
 
 
-def test_directories_created():
-    assert config.DATA_DIR.exists()
-    assert config.CHROMA_DIR.exists()
+def test_ensure_dirs_creates_requested_dirs(tmp_path):
+    target = tmp_path / "a" / "b"
+    config.ensure_dirs(target)
+    assert target.is_dir()
 
 
 def test_default_llm_model_groq(monkeypatch):

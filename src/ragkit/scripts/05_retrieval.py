@@ -1,145 +1,84 @@
 """Retrieval mechanisms for RAG.
 
 Methods:
-  - basic:     vanilla vector similarity search
-  - rerank:    retrieve top-k candidates, then rerank with FlashRank
+  - basic:      vanilla vector similarity search
+  - rerank:     retrieve top-k candidates, then rerank with FlashRank (cross-encoder)
   - rag-fusion: generate multiple queries, retrieve for each, fuse with RRF
-  - hybrid:    combine BM25 (keyword) + dense (semantic) via ensemble
-
-All methods are run on the same query for easy comparison.
+  - hybrid:     combine BM25 (keyword) + dense (semantic) via weighted RRF
 """
 
 import argparse
-import pickle
+import importlib
 import sys
+from functools import lru_cache
 
-from langchain_classic.load import dumps, loads
 from langchain_classic.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from langchain_classic.retrievers.document_compressors import FlashrankRerank
 from langchain_community.retrievers import BM25Retriever
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 
-from ragkit.config import CHROMA_DIR
-from ragkit.utils import (
-    format_docs,
-    get_llm,
-    get_vectorstore,
-    load_web,
-    split_docs,
-)
+from ragkit import corpus
+from ragkit.pipeline import RAGResult
+from ragkit.utils import generate_answer
 
-URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
-BM25_CACHE = CHROMA_DIR / "splits_05.pkl"
-
-
-# ============================================================
-# Method 1: Basic dense retrieval
-# ============================================================
-def build_basic(vectorstore):
-    return vectorstore.as_retriever(search_kwargs={"k": 4})
-
-
-# ============================================================
-# Method 2: Reranking with FlashRank
-# ============================================================
-def build_rerank(vectorstore):
-    """Retrieve top-10 candidates, rerank to top-4 with FlashRank."""
-    base = vectorstore.as_retriever(search_kwargs={"k": 10})
-    compressor = FlashrankRerank(top_n=4)
-    return ContextualCompressionRetriever(
-        base_compressor=compressor,
-        base_retriever=base,
-    )
-
-
-# ============================================================
-# Method 3: RAG-Fusion
-# ============================================================
-def build_rag_fusion(vectorstore, num_queries: int = 4):
-    """Generate multiple queries, retrieve for each, fuse with RRF."""
-    generate_prompt = ChatPromptTemplate.from_template(
-        """You are a helpful assistant. Generate {num} different search queries
-that would help answer the user's question. Each query should approach the
-topic from a different angle.
-
-Original question: {question}
-
-Output one query per line. No numbering, no bullets, no preamble."""
-    )
-
-    def retrieve(question: str):
-        chain = (
-            generate_prompt
-            | get_llm()
-            | StrOutputParser()
-            | (lambda x: [q.strip() for q in x.split("\n") if q.strip()])
-        )
-        queries = chain.invoke({"num": num_queries, "question": question})
-        all_results = vectorstore.as_retriever(search_kwargs={"k": 4}).batch(queries)
-
-        # Reciprocal Rank Fusion
-        fused = {}
-        for docs in all_results:
-            for rank, doc in enumerate(docs):
-                key = dumps(doc)
-                fused[key] = fused.get(key, 0) + 1 / (rank + 60)
-        ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)
-        return [loads(key) for key, _ in ranked[:4]]
-
-    # Wrap as a callable retriever-like object
-    class RAGFusionRetriever:
-        def invoke(self, question):
-            return retrieve(question)
-
-        def batch(self, questions):
-            return [retrieve(q) for q in questions]
-
-    return RAGFusionRetriever()
-
-
-# ============================================================
-# Method 4: Hybrid (BM25 + dense)
-# ============================================================
-def build_hybrid(splits, vectorstore):
-    """Ensemble: BM25 (keyword) + dense (semantic) with weighted scoring."""
-    bm25 = BM25Retriever.from_documents(splits)
-    bm25.k = 4
-    dense = vectorstore.as_retriever(search_kwargs={"k": 4})
-    return EnsembleRetriever(
-        retrievers=[bm25, dense],
-        weights=[0.4, 0.6],  # favor semantic slightly
-    )
-
-
-# ============================================================
-# Final answer generation
-# ============================================================
-def generate_answer(question: str, docs) -> str:
-    prompt = ChatPromptTemplate.from_template(
-        """Answer the question based ONLY on the context below.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-    )
-    chain = prompt | get_llm() | StrOutputParser()
-    return chain.invoke({"context": format_docs(docs), "question": question})
-
-
-# ============================================================
-# CLI entry point
-# ============================================================
 METHODS = ["basic", "rerank", "rag-fusion", "hybrid"]
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Compare retrieval mechanisms (Groq + HuggingFace)"
+def build_basic(vectorstore, k: int = 4):
+    return vectorstore.as_retriever(search_kwargs={"k": k})
+
+
+def build_rerank(vectorstore, candidates: int = 10, top_n: int = 4):
+    """Retrieve top-`candidates` by embedding, rerank to `top_n` with FlashRank."""
+    return ContextualCompressionRetriever(
+        base_compressor=FlashrankRerank(top_n=top_n),
+        base_retriever=vectorstore.as_retriever(search_kwargs={"k": candidates}),
     )
+
+
+def build_rag_fusion(vectorstore):
+    """Reuse script 02's RAG-Fusion so both scripts measure the same thing."""
+    script02 = importlib.import_module("ragkit.scripts.02_query_transformations")
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    return RunnableLambda(lambda q: script02.rag_fusion_method(retriever, q))
+
+
+def build_hybrid(splits, vectorstore, k: int = 4, weights=(0.4, 0.6)):
+    """Ensemble: BM25 (keyword) + dense (semantic), fused with weighted RRF."""
+    bm25 = BM25Retriever.from_documents(splits)
+    bm25.k = k
+    return EnsembleRetriever(
+        retrievers=[bm25, vectorstore.as_retriever(search_kwargs={"k": k})],
+        weights=list(weights),
+    )
+
+
+@lru_cache(maxsize=len(METHODS))
+def get_retriever(method: str):
+    vectorstore = corpus.default_vectorstore()
+    if method == "basic":
+        return build_basic(vectorstore)
+    if method == "rerank":
+        print("  Note: FlashRank downloads its model once, then caches.", file=sys.stderr)
+        return build_rerank(vectorstore)
+    if method == "rag-fusion":
+        return build_rag_fusion(vectorstore)
+    if method == "hybrid":
+        return build_hybrid(corpus.load_splits(), vectorstore)
+    raise ValueError(f"Unknown method: {method}")
+
+
+def run(question: str, method: str = "rerank") -> RAGResult:
+    docs = get_retriever(method).invoke(question)
+    return RAGResult(
+        answer=generate_answer(question, docs),
+        contexts=[d.page_content for d in docs],
+        metadata={"method": method},
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare retrieval mechanisms")
     parser.add_argument("--question", required=True)
     parser.add_argument(
         "--method",
@@ -149,39 +88,12 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"\n[setup] Loading + indexing {URL}...", file=sys.stderr)
-    if BM25_CACHE.exists():
-        print(f"  Loading cached splits from {BM25_CACHE}", file=sys.stderr)
-        splits = pickle.load(open(BM25_CACHE, "rb"))
-    else:
-        splits = split_docs(load_web(URL))
-        pickle.dump(splits, open(BM25_CACHE, "wb"))
-        print(f"  Cached {len(splits)} splits to {BM25_CACHE}", file=sys.stderr)
-
-    vectorstore = get_vectorstore(splits, name="05_retrieval")
-
     print(f"\n[retrieve] Method: {args.method}", file=sys.stderr)
-    print(f"[retrieve] Question: {args.question}", file=sys.stderr)
+    result = run(args.question, method=args.method)
+    print(f"  Retrieved {len(result.contexts)} docs", file=sys.stderr)
 
-    if args.method == "basic":
-        retriever = build_basic(vectorstore)
-        docs = retriever.invoke(args.question)
-    elif args.method == "rerank":
-        print("  Note: FlashRank downloads ~100MB on first run, then caches.", file=sys.stderr)
-        retriever = build_rerank(vectorstore)
-        docs = retriever.invoke(args.question)
-    elif args.method == "rag-fusion":
-        retriever = build_rag_fusion(vectorstore)
-        docs = retriever.invoke(args.question)
-    elif args.method == "hybrid":
-        retriever = build_hybrid(splits, vectorstore)
-        docs = retriever.invoke(args.question)
-
-    print(f"  Retrieved {len(docs)} docs", file=sys.stderr)
-
-    print("\n[generate] Producing final answer...\n", file=sys.stderr)
     print("=" * 60)
-    print(generate_answer(args.question, docs))
+    print(result.answer)
     print("=" * 60)
 
 

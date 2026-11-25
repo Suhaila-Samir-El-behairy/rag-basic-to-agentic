@@ -24,7 +24,9 @@ htmlcov/
 # Project data
 chroma_db/
 bm25_cache*.pkl
-data/
+data/*
+!data/eval/
+results/
 
 # IDE
 .vscode/
