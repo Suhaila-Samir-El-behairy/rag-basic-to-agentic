@@ -1,33 +1,36 @@
-"""Smoke test for script 01."""
+"""Offline tests for script 01 and the shared corpus cache."""
 
 import importlib
-import os
 
-import pytest
+from langchain_core.documents import Document
 
+from ragkit import corpus
 
-def _load_script():
-    """Load script 01 via importlib (works around digit-prefixed module name)."""
-    return importlib.import_module("ragkit.scripts.01_basic_rag")
+from ..conftest import fake_retriever
 
-
-def test_module_imports():
-    mod = _load_script()
-    assert hasattr(mod, "main")
-    assert hasattr(mod, "URL")
+mod = importlib.import_module("ragkit.scripts.01_basic_rag")
 
 
-def test_url_is_lilian_weng():
-    mod = _load_script()
-    assert "lilianweng" in mod.URL
+def test_run_returns_answer_and_contexts(monkeypatch, fake_llm):
+    from ragkit import utils
+
+    fake_llm(utils)
+    monkeypatch.setattr(mod, "default_retriever", lambda k: fake_retriever(["c1", "c2"]))
+    result = mod.run("q")
+    assert result.answer == "fake answer"
+    assert result.contexts == ["c1", "c2"]
 
 
-@pytest.mark.skipif(
-    not os.getenv("GROQ_API_KEY"),
-    reason="Set GROQ_API_KEY to run integration test",
-)
-def test_chain_construction():
-    """Verify the build_chain function works without errors."""
-    mod = _load_script()
-    # Just verify the function exists and is callable
-    assert callable(mod.build_chain)
+def test_corpus_splits_are_cached_and_numbered(monkeypatch):
+    calls = []
+
+    def fake_load(url):
+        calls.append(url)
+        return [Document(page_content="word " * 1000)]
+
+    monkeypatch.setattr(corpus.utils, "load_web", fake_load)
+    first = corpus.load_splits()
+    second = corpus.load_splits()
+    assert len(calls) == 1, "the web page should be downloaded once"
+    assert [s.metadata["chunk_id"] for s in first] == list(range(len(first)))
+    assert [s.page_content for s in second] == [s.page_content for s in first]

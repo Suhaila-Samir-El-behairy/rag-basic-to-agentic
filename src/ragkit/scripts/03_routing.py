@@ -2,8 +2,8 @@
 
 Sources:
   - vectorstore: Lilian Weng's LLM agent blog post
-  - wiki:       DuckDuckGo (general knowledge, no key needed)
-  - arxiv:      arXiv (academic papers, new Client API)
+  - web:         public web search (DuckDuckGo, or Tavily if a key is set)
+  - arxiv:       arXiv (academic papers)
 
 The LLM acts as a classifier via structured output, then we retrieve
 from the chosen source and generate a final answer.
@@ -13,20 +13,22 @@ import argparse
 import sys
 from typing import Literal
 
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
-from ragkit.utils import format_docs, get_llm, get_vectorstore, load_web, split_docs, web_search
+from ragkit.corpus import default_retriever
+from ragkit.pipeline import RAGResult
+from ragkit.utils import generate_answer, get_llm, web_search
 
-URL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
+ROUTES = ("vectorstore", "web", "arxiv")
+FALLBACK_ROUTE = "vectorstore"
 
 
 # ============================================================
 # Router: structured-output classifier
 # ============================================================
 class RouteQuery(BaseModel):
-    datasource: Literal["vectorstore", "wiki", "arxiv"] = Field(
+    datasource: Literal["vectorstore", "web", "arxiv"] = Field(
         description="The best data source to answer the question."
     )
 
@@ -41,11 +43,11 @@ Choose exactly ONE source:
   ReAct, chain-of-thought, planning, memory, tool use, or anything covered
   in Lilian Weng's blog post on LLM-powered autonomous agents.
 
-- wiki: General knowledge questions (history, science, geography, people,
-  everyday concepts, definitions). Backed by DuckDuckGo web search.
+- web: General knowledge or current-events questions (history, science,
+  geography, people, products, everyday concepts, definitions).
 
-- arxiv: Academic or research questions, paper lookups, technical concepts
-  in machine learning, AI, statistics, or physics.
+- arxiv: Questions asking for specific academic papers or recent research
+  results in machine learning, AI, statistics, or physics.
 
 Question: {question}
 
@@ -54,99 +56,74 @@ Return the source name."""
     return prompt | get_llm().with_structured_output(RouteQuery)
 
 
-# ============================================================
-# Source-specific retrievers
-# ============================================================
-def get_vector_retriever():
-    docs = load_web(URL)
-    splits = split_docs(docs)
-    vectorstore = get_vectorstore(splits, name="03_routing")
-    return vectorstore.as_retriever(search_kwargs={"k": 4})
+def route(question: str) -> tuple[str, str | None]:
+    """Return (datasource, error). Falls back to the vector store if the router fails."""
+    try:
+        return build_router().invoke({"question": question}).datasource, None
+    except Exception as e:  # noqa: BLE001 - malformed structured output is common on free models
+        return FALLBACK_ROUTE, f"{type(e).__name__}: {e}"
 
 
 # ============================================================
 # Retrieve from the chosen source
 # ============================================================
-def retrieve_from_source(datasource: str, question: str) -> str:
-    """Returns a single context string ready for the answer LLM."""
+def search_arxiv(query: str, max_results: int = 3, summary_chars: int | None = None) -> str:
+    import arxiv
+
+    client = arxiv.Client(page_size=max_results, delay_seconds=2, num_retries=3)
+    search = arxiv.Search(
+        query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance
+    )
+    results = [
+        f"Title: {paper.title}\n"
+        f"Authors: {', '.join(a.name for a in paper.authors)}\n"
+        f"Published: {paper.published.strftime('%Y-%m-%d')}\n"
+        f"Summary: {paper.summary[:summary_chars] if summary_chars else paper.summary}"
+        for paper in client.results(search)
+    ]
+    return "\n\n---\n\n".join(results) if results else "No papers found."
+
+
+def retrieve_from_source(datasource: str, question: str) -> list[str]:
+    """Return the retrieved contexts for the chosen source."""
     if datasource == "vectorstore":
-        retriever = get_vector_retriever()
-        docs = retriever.invoke(question)
-        return format_docs(docs[:4])
-
-    if datasource == "wiki":
-        # DuckDuckGo (no key, more reliable than Wikipedia API)
-        return web_search(question, max_results=4)
-
+        return [d.page_content for d in default_retriever().invoke(question)]
+    if datasource == "web":
+        return [web_search(question, max_results=4)]
     if datasource == "arxiv":
-        # New arXiv library API (arxiv.Client + .results())
-        import arxiv
-
-        client = arxiv.Client(page_size=3, delay_seconds=2, num_retries=3)
-        search = arxiv.Search(
-            query=question,
-            max_results=3,
-            sort_by=arxiv.SortCriterion.Relevance,
-        )
-        results = []
-        for paper in client.results(search):
-            results.append(
-                f"Title: {paper.title}\n"
-                f"Authors: {', '.join(a.name for a in paper.authors)}\n"
-                f"Published: {paper.published.strftime('%Y-%m-%d')}\n"
-                f"Summary: {paper.summary}"
-            )
-        return "\n\n---\n\n".join(results) if results else "No papers found."
-
+        return [search_arxiv(question)]
     raise ValueError(f"Unknown datasource: {datasource}")
 
 
-# ============================================================
-# Final answer generation
-# ============================================================
-def generate_answer(question: str, context: str) -> str:
-    prompt = ChatPromptTemplate.from_template(
-        """Answer the question based ONLY on the context below.
-If the context doesn't contain the answer, say "I don't know based on this source."
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
+def run(question: str) -> RAGResult:
+    datasource, router_error = route(question)
+    contexts = retrieve_from_source(datasource, question)
+    return RAGResult(
+        answer=generate_answer(question, "\n\n".join(contexts)),
+        contexts=contexts,
+        tool_calls=[datasource],
+        metadata={"router_error": router_error} if router_error else {},
     )
-    chain = prompt | get_llm() | StrOutputParser()
-    return chain.invoke({"context": context, "question": question})
 
 
 # ============================================================
 # CLI entry point
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="Route questions to vectorstore / wiki / arxiv (Groq-powered)"
-    )
+    parser = argparse.ArgumentParser(description="Route questions to vectorstore / web / arxiv")
     parser.add_argument("--question", required=True)
     args = parser.parse_args()
 
-    # Step 1: route
     print("\n[router] Classifying question...", file=sys.stderr)
-    router = build_router()
-    route = router.invoke({"question": args.question})
-    print(f"[router] → {route.datasource}\n", file=sys.stderr)
-
-    # Step 2: retrieve
-    print(f"[retrieve] Fetching from {route.datasource}...", file=sys.stderr)
-    context = retrieve_from_source(route.datasource, args.question)
-    preview = context[:200].replace("\n", " ")
+    result = run(args.question)
+    print(f"[router] → {result.tool_calls[0]}", file=sys.stderr)
+    if result.metadata.get("router_error"):
+        print(f"[router] router failed, used fallback: {result.metadata}", file=sys.stderr)
+    preview = "\n".join(result.contexts)[:200].replace("\n", " ")
     print(f"[retrieve] Context preview: {preview}...\n", file=sys.stderr)
 
-    # Step 3: generate
-    print("[generate] Producing final answer...\n", file=sys.stderr)
     print("=" * 60)
-    answer = generate_answer(args.question, context)
-    print(answer)
+    print(result.answer)
     print("=" * 60)
 
 

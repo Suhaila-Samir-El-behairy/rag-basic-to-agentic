@@ -1,4 +1,8 @@
-"""Global configuration."""
+"""Global configuration.
+
+Importing this module has no filesystem side effects; directories are created
+lazily by :func:`ensure_dirs` when something actually needs to write.
+"""
 
 import os
 from pathlib import Path
@@ -11,8 +15,8 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
-DATA_DIR.mkdir(exist_ok=True)
-CHROMA_DIR.mkdir(exist_ok=True)
+RESULTS_DIR = PROJECT_ROOT / "results"
+EVAL_DATA_DIR = DATA_DIR / "eval"
 
 # API keys
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -21,14 +25,11 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
 
-# LangSmith tracing
-os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY or ""
-os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "false")
-os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "rag-from-scratch-to-agentic")
-os.environ["LANGCHAIN_ENDPOINT"] = os.getenv(
-    "LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com"
-)
-os.environ.setdefault("USER_AGENT", "ragkit/0.1.0")
+# LangSmith tracing is opt-in: set LANGCHAIN_TRACING_V2=true and LANGCHAIN_API_KEY in .env.
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
+os.environ.setdefault("LANGCHAIN_PROJECT", "rag-basic-to-agentic")
+os.environ.setdefault("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+os.environ.setdefault("USER_AGENT", "ragkit/0.2.0")
 
 # Provider + model
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
@@ -44,3 +45,9 @@ DEFAULT_K = 4
 
 def get_default_llm_model() -> str:
     return GROQ_MODEL if LLM_PROVIDER == "groq" else GEMINI_MODEL
+
+
+def ensure_dirs(*dirs: Path) -> None:
+    """Create the given directories (default: data + vector store dirs)."""
+    for d in dirs or (DATA_DIR, CHROMA_DIR):
+        d.mkdir(parents=True, exist_ok=True)
